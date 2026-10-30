@@ -12,7 +12,7 @@ import (
 
 func TestRejectInvalidHistory(t *testing.T) {
 	commit := vsr.Observation{Kind: vsr.Committed, Replica: 0,
-		State: vsr.Counters{Op: 1, Commit: 1}, Index: 1,
+		State: vsr.Counters{Op: 1, Commit: 1}, Index: 1, RequestID: 1,
 		Command: kv.Command{Op: kv.Add, Key: "x", Value: 1}}
 	apply := commit
 	apply.Kind = vsr.Applied
@@ -70,7 +70,7 @@ func TestIndependentApplicationModel(t *testing.T) {
 		{Op: 255, Key: "x"},
 	}
 	for i, command := range commands {
-		p.Step(vsr.Message{Kind: vsr.Request, From: vsr.ClientEndpoint, To: 0, Command: command})
+		p.Step(vsr.Message{Kind: vsr.Request, From: vsr.ClientEndpoint, To: 0, RequestID: uint64(i + 1), Command: command})
 		for _, effect := range p.Step(vsr.Message{Kind: vsr.PrepareOK, From: 1, To: 0, Op: uint64(i + 1)}) {
 			if effect.Kind == vsr.ObserveEffect {
 				if err := c.Observe(effect.Observation); err != nil {
@@ -78,5 +78,20 @@ func TestIndependentApplicationModel(t *testing.T) {
 				}
 			}
 		}
+	}
+	if p.State().Applied != uint64(len(commands)) {
+		t.Fatal("model workload did not execute", p.State())
+	}
+}
+
+func TestRejectDuplicateLogicalRequest(t *testing.T) {
+	var c checker.Checker
+	o := vsr.Observation{Kind: vsr.Committed, Replica: 0, State: vsr.Counters{Op: 1, Commit: 1}, Index: 1, RequestID: 7, Command: kv.Command{Op: kv.Add, Value: 1}}
+	if err := c.Observe(o); err != nil {
+		t.Fatal(err)
+	}
+	o.Index, o.State.Op, o.State.Commit = 2, 2, 2
+	if err := c.Observe(o); err == nil || !strings.Contains(err.Error(), "multiple positions") {
+		t.Fatal(err)
 	}
 }

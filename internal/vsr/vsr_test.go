@@ -88,6 +88,8 @@ func newCluster(t *testing.T, delay func(vsr.Message) sim.Time) *cluster {
 					if effect.Observation.Kind == vsr.Applied {
 						c.observedApplied[id] = effect.Observation.Index
 					}
+				case vsr.ArmEffect, vsr.CancelEffect:
+					// M3 reliable-delivery fixtures do not need retry timers.
 				case vsr.SendEffect:
 					c.send(t, effect.Message)
 				default:
@@ -143,7 +145,7 @@ func (c *cluster) send(t *testing.T, m vsr.Message) {
 	c.diagram.Messages = append(c.diagram.Messages, &diagramMessage{ID: id, Sent: c.runner.Now(), Message: m})
 }
 func (c *cluster) request(t *testing.T, command kv.Command) {
-	c.send(t, vsr.Message{Kind: vsr.Request, From: vsr.ClientEndpoint, To: 0, Command: command})
+	c.send(t, vsr.Message{Kind: vsr.Request, From: vsr.ClientEndpoint, To: 0, RequestID: uint64(len(c.replies) + 1), Command: command})
 }
 
 func scenario(t *testing.T) *cluster {
@@ -198,8 +200,8 @@ func TestNormalDemo(t *testing.T) {
 
 func TestQuorumGate(t *testing.T) {
 	p := vsr.New(0)
-	effects := p.Step(vsr.Message{Kind: vsr.Request, From: vsr.ClientEndpoint, To: 0, Command: commands[1]})
-	if len(effects) != 2 || p.State() != (vsr.Counters{Op: 1}) || len(p.Snapshot()) != 0 {
+	effects := p.Step(vsr.Message{Kind: vsr.Request, From: vsr.ClientEndpoint, To: 0, RequestID: 1, Command: commands[1]})
+	if len(effects) != 3 || p.State() != (vsr.Counters{Op: 1}) || len(p.Snapshot()) != 0 {
 		t.Fatal(effects, p.State())
 	}
 	// Prepare both backups but hold both replies outside the primary.
@@ -216,7 +218,7 @@ func TestQuorumGate(t *testing.T) {
 		t.Fatal("committed without acknowledgment")
 	}
 	t.Logf("both ACKs held: view=%d op=%d commit=%d applied=%d replies=0", p.State().View, p.State().Op, p.State().Commit, p.State().Applied)
-	if got := p.Step(vsr.Message{Kind: vsr.Request, From: vsr.ClientEndpoint, To: 0, Command: commands[2]}); len(got) != 0 || p.State().Op != 1 {
+	if got := p.Step(vsr.Message{Kind: vsr.Request, From: vsr.ClientEndpoint, To: 0, RequestID: 2, Command: commands[2]}); len(got) != 0 || p.State().Op != 1 {
 		t.Fatal("accepted a second pending proposal", got)
 	}
 	for _, bad := range []vsr.Message{
@@ -230,7 +232,7 @@ func TestQuorumGate(t *testing.T) {
 		}
 	}
 	out := p.Step(acks[0])
-	if len(out) != 5 || out[0].Observation.Kind != vsr.Committed || out[1].Observation.Kind != vsr.Applied ||
+	if len(out) != 6 || out[0].Observation.Kind != vsr.Committed || out[1].Observation.Kind != vsr.Applied ||
 		out[4].Message.Kind != vsr.Reply || out[4].Message.Result.Value != 1 {
 		t.Fatal(out)
 	}
@@ -243,12 +245,12 @@ func TestQuorumGate(t *testing.T) {
 	}
 	// A read must also wait for a new quorum; a late ack for the write cannot
 	// authorize it, even though the primary already has the requested value.
-	p.Step(vsr.Message{Kind: vsr.Request, From: vsr.ClientEndpoint, To: 0, Command: commands[2]})
+	p.Step(vsr.Message{Kind: vsr.Request, From: vsr.ClientEndpoint, To: 0, RequestID: 2, Command: commands[2]})
 	if got := p.Step(acks[0]); len(got) != 0 || p.State().Applied != 1 {
 		t.Fatal("read used stale acknowledgment", got)
 	}
 	read := p.Step(vsr.Message{Kind: vsr.PrepareOK, From: 2, To: 0, Op: 2})
-	if len(read) != 5 || read[4].Message.Result.Value != 1 || p.State().Applied != 2 {
+	if len(read) != 6 || read[4].Message.Result.Value != 1 || p.State().Applied != 2 {
 		t.Fatal(read)
 	}
 }
@@ -259,7 +261,7 @@ func TestBackupCommitTransitions(t *testing.T) {
 	commands := []kv.Command{{Op: kv.Put, Key: "x", Value: 7}, {Op: kv.Add, Key: "x", Value: 5}, {Op: kv.Put, Key: "x", Value: -2}}
 	results := []int64{7, 12, -2}
 	for i, command := range commands {
-		out := b.Step(vsr.Message{Kind: vsr.Prepare, From: 0, To: 1, Op: uint64(i + 1), Command: command})
+		out := b.Step(vsr.Message{Kind: vsr.Prepare, From: 0, To: 1, Op: uint64(i + 1), RequestID: uint64(i + 1), Command: command})
 		if len(out) != 1 {
 			t.Fatal(out)
 		}
@@ -271,13 +273,13 @@ func TestBackupCommitTransitions(t *testing.T) {
 	}
 	for i, effect := range out {
 		index := uint64(i/2 + 1)
-		want := vsr.Observation{Kind: vsr.Committed, Replica: 1, State: vsr.Counters{Op: 3, Commit: index, Applied: index - 1}, Index: index, Command: commands[index-1]}
+		want := vsr.Observation{Kind: vsr.Committed, Replica: 1, State: vsr.Counters{Op: 3, Commit: index, Applied: index - 1}, Index: index, RequestID: index, Command: commands[index-1]}
 		if i%2 == 1 {
 			want.Kind = vsr.Applied
 			want.State.Applied = index
 			want.Result.Value = results[index-1]
 		}
-		if effect.Kind != vsr.ObserveEffect || effect.Observation != want {
+		if effect.Kind != vsr.ObserveEffect || !reflect.DeepEqual(effect.Observation, want) {
 			t.Fatalf("transition %d: got %+v want %+v", i, effect, want)
 		}
 		if err := check.Observe(effect.Observation); err != nil {
@@ -297,17 +299,17 @@ func TestBackupCommitTransitions(t *testing.T) {
 func TestPiggybackAndUnsupportedInputs(t *testing.T) {
 	b := vsr.New(1)
 	for _, m := range []vsr.Message{
-		{Kind: vsr.Prepare, From: 0, To: 1, Op: 2},
-		{Kind: vsr.Prepare, From: 2, To: 1, Op: 1},
-		{Kind: vsr.Commit, From: 0, To: 1, Commit: 1},
+		{Kind: vsr.Prepare, From: 0, To: 1, Op: 2, RequestID: 2, View: 1},
+		{Kind: vsr.Prepare, From: 2, To: 1, Op: 1, RequestID: 1},
+		{Kind: vsr.Commit, From: 2, To: 1, Commit: 1},
 		{Kind: vsr.Request, From: vsr.ClientEndpoint, To: 1},
 	} {
 		if got := b.Step(m); len(got) != 0 || b.State().Op != 0 {
 			t.Fatal(got)
 		}
 	}
-	b.Step(vsr.Message{Kind: vsr.Prepare, From: 0, To: 1, Op: 1, Command: commands[1]})
-	out := b.Step(vsr.Message{Kind: vsr.Prepare, From: 0, To: 1, Op: 2, Commit: 1, Command: commands[2]})
+	b.Step(vsr.Message{Kind: vsr.Prepare, From: 0, To: 1, Op: 1, RequestID: 1, Command: commands[1]})
+	out := b.Step(vsr.Message{Kind: vsr.Prepare, From: 0, To: 1, Op: 2, RequestID: 2, Commit: 1, Command: commands[2]})
 	if len(out) != 3 || out[1].Observation.Result.Value != 1 || b.State().Applied != 1 {
 		t.Fatal(out)
 	}
