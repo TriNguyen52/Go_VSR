@@ -1,4 +1,4 @@
-# Educational Viewstamped Replication in Go
+# Viewstamped Replication in Go
 
 This project implements **Viewstamped Replication (VSR)** through a key-value store supporting `Put` (set a value), `Add` (increase or decrease it), and `Get` (read it). A missing key reads as zero. Adding beyond the integer's limits returns an error without changing the data.
 
