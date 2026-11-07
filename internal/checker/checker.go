@@ -23,6 +23,15 @@ type Checker struct {
 	replicas  [vsr.ReplicaCount]progress
 }
 
+// Restart forgets only a crashed process's local progress, retaining global
+// committed history so reconstruction is still checked against prior results.
+func (c *Checker) Restart(id int) {
+	if id < 0 || id >= vsr.ReplicaCount {
+		panic("checker: invalid replica")
+	}
+	c.replicas[id] = progress{}
+}
+
 // Observe checks one commit or execution reported by a replica.
 // View observations additionally check selection and installed history.
 func (c *Checker) Observe(o vsr.Observation) error {

@@ -4,3 +4,4 @@ vsr-go-research-report.md
 artifacts/
 tools/
 internal/vsr/visualization_test.go
+docs/

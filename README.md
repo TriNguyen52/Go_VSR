@@ -49,17 +49,17 @@ when retrying, allowing the new primary to return the existing result.
 The current failures are stopped replicas and messages that are delayed, lost, duplicated, or reordered. Sender identities are trusted. Corrupted data are not considered.
 
 
-**Crash recovery is unfinished.** A stopped replica stays stopped for the rest of the current scenario. Restoring a network link is supported because the replica still remembers its state. Losing all in-memory copies loses the data, and there is no disk persistence to restore it.
+**Crash recovery is implemented (M8).** A restarted replica begins empty and cannot vote until both survivors respond, including the primary of the highest reported view. At most one replica may be crashed or recovering at a time. Losing all volatile copies remains unsupported; there is no disk persistence. The single client stays alive and keeps increasing request numbers.
 
-The client also stays alive throughout a scenario. Its identity is fixed and its request numbers increase 
+## Recovery demonstration
 
+```powershell
+go test ./internal/vsr -run '^TestRecoveryDemo$' -count=1 -v
+```
 
-## Next implementation step: Recovery protocol
+![Recovery protocol sequence](docs/recovery.svg)
 
-The next milestone is to let a replica restart with empty memory and safely rejoin the other two. It needs a separate recovery state in which it cannot approve requests or count toward a quorum.
-
-The planned recovery exchange uses `RECOVERY` and `RECOVERY_RESPONSE` messages.
-Each attempt carries a fresh ID used to distinguish the current attempt from delayed replies to an earlier one. The restarting replica must collect responses from both surviving replicas, including the primary of the highest view reported, then rebuild its log, store, and saved request results before participating normally. 
+See [recovery protocol details](docs/recovery.md) for nonce handling, timer fencing, and the failure budget.
 
 ## Files
 

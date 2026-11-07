@@ -19,17 +19,22 @@ import (
 
 // Scripted faults live at the adapter boundary; all protocol work stays in Step.
 type retryCluster struct {
-	runner     sim.Runner
-	replicas   [3]*vsr.Replica
-	client     client.Client
-	checker    checker.Checker
-	tokens     [4]sim.TimerToken
-	callbacks  [4]vsr.Message
-	drop       func(vsr.Message) bool
-	deliveries func(vsr.Message) []sim.Time // One delay per copy; nil drops the packet.
-	trace      strings.Builder
-	applies    [3]int
-	diagram    retryDiagram
+	incarnation      [3]uint64
+	timerIncarnation [4]uint64
+	clockTokens      [3]sim.TimerToken
+	nextNonce        uint64
+	stopped          [3]bool
+	runner           sim.Runner
+	replicas         [3]*vsr.Replica
+	client           client.Client
+	checker          checker.Checker
+	tokens           [4]sim.TimerToken
+	callbacks        [4]vsr.Message
+	drop             func(vsr.Message) bool
+	deliveries       func(vsr.Message) []sim.Time // One delay per copy; nil drops the packet.
+	trace            strings.Builder
+	applies          [3]int
+	diagram          retryDiagram
 }
 
 // Recorded adapter events only; visualization never changes protocol inputs.
@@ -51,6 +56,23 @@ func newRetryCluster(t *testing.T, drop func(vsr.Message) bool) *retryCluster {
 			c.replicas[id] = vsr.New(id)
 		}
 		c.runner.Register(endpoint(id), func(e sim.Event) {
+			if id < 3 && c.stopped[id] {
+				return
+			}
+			if e.Kind == sim.Timeout && id < 3 {
+				if e.Timer.Name == "clock" {
+					if e.Timer != c.clockTokens[id] {
+						return
+					}
+				} else if c.timerIncarnation[id] != c.incarnation[id] {
+					return
+				}
+			}
+			if e.Kind == sim.Timeout && e.Timer.Name == "clock" {
+				c.effects(t, id, c.replicas[id].AdvanceTime())
+				c.clockTokens[id] = c.runner.Arm(endpoint(id), "clock", 1)
+				return
+			}
 			var m vsr.Message
 			if e.Kind == sim.Timeout {
 				m = c.callbacks[id]
@@ -124,6 +146,9 @@ func (c *retryCluster) effects(t *testing.T, owner int, effects []vsr.Effect) {
 			delay := sim.Time(10)
 			if owner == vsr.ClientEndpoint {
 				delay = 30
+			}
+			if owner < 3 {
+				c.timerIncarnation[owner] = c.incarnation[owner]
 			}
 			c.callbacks[owner] = effect.Message
 			c.tokens[owner] = c.runner.Arm(endpoint(owner), "retry", delay)

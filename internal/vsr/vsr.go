@@ -1,5 +1,5 @@
 // Package vsr implements normal VSR request processing of Viewstamped Replication Revisited.
-// It supports three replicas, one client, retries, catch-up, and explicit view changes.
+// It supports three replicas, one client, retries, catch-up, and automatic view changes.
 package vsr
 
 import (
@@ -18,21 +18,24 @@ const ClientEndpoint = 3
 type Kind string
 
 const (
-	Request         Kind = "REQUEST"
-	Prepare         Kind = "PREPARE"
-	PrepareOK       Kind = "PREPARE_OK"
-	Commit          Kind = "COMMIT"
-	Reply           Kind = "REPLY"
-	Retry           Kind = "RETRY"  // Local timer input, never a network message.
-	Reject          Kind = "REJECT" // Request ID reused with different command fields.
-	FetchState      Kind = "FETCH_STATE"
-	StateTransfer   Kind = "STATE"
-	TransferRetry   Kind = "TRANSFER_RETRY" // Local input, never a network message.
-	Suspect         Kind = "SUSPECT"        // Local input naming a strictly newer view.
-	ViewRetry       Kind = "VIEW_RETRY"
-	StartViewChange Kind = "START_VIEW_CHANGE"
-	DoViewChange    Kind = "DO_VIEW_CHANGE"
-	StartView       Kind = "START_VIEW"
+	Request          Kind = "REQUEST"
+	Prepare          Kind = "PREPARE"
+	PrepareOK        Kind = "PREPARE_OK"
+	Commit           Kind = "COMMIT"
+	Reply            Kind = "REPLY"
+	Retry            Kind = "RETRY"  // Local timer input, never a network message.
+	Reject           Kind = "REJECT" // Request ID reused with different command fields.
+	FetchState       Kind = "FETCH_STATE"
+	StateTransfer    Kind = "STATE"
+	TransferRetry    Kind = "TRANSFER_RETRY" // Local input, never a network message.
+	Suspect          Kind = "SUSPECT"        // Local input naming a strictly newer view.
+	ViewRetry        Kind = "VIEW_RETRY"
+	StartViewChange  Kind = "START_VIEW_CHANGE"
+	DoViewChange     Kind = "DO_VIEW_CHANGE"
+	StartView        Kind = "START_VIEW"
+	Recovery         Kind = "RECOVERY"
+	RecoveryResponse Kind = "RECOVERY_RESPONSE"
+	RecoveryRetry    Kind = "RECOVERY_RETRY" // Local timer input.
 )
 
 // Message carries a client request, replication message, or reply.
@@ -43,6 +46,7 @@ const (
 // Result carries the reply to the client.
 // Entries is read-only during Step; emitted STATE messages own their log copy.
 type Message struct {
+	Nonce            uint64 // Injected fresh recovery identity; never reused across restarts.
 	LastNormalView   uint64
 	Kind             Kind
 	From, To         int
@@ -51,7 +55,7 @@ type Message struct {
 	Result           kv.Result
 	RequestID        uint64     // Client identity is From for REQUEST, otherwise ClientEndpoint.
 	TransferID       uint64     // Separate from client request IDs; scoped to requester and view.
-	Entries          []LogEntry // STATE only; full log, with positions implied by order.
+	Entries          []LogEntry // Full history for transfer and view-change messages.
 }
 
 // LogEntry transfers request identity and command, never cached application results.
@@ -113,6 +117,10 @@ type Effect struct {
 
 // Replica stores one member's log, application state, and progress.
 type Replica struct {
+	recovering         bool
+	nonce              uint64
+	recoveryReports    [ReplicaCount]*Message
+	elapsed            uint64 // Logical time units since primary activity or view entry.
 	changing           bool
 	lastNormalView     uint64
 	starts             [ReplicaCount]bool
@@ -176,6 +184,9 @@ func (r *Replica) Snapshot() []kv.Entry { return r.store.Snapshot() }
 func (r *Replica) Step(m Message) []Effect {
 	if m.To != r.id {
 		return nil
+	}
+	if effects, handled := r.recoveryStep(m); handled {
+		return effects
 	}
 	if effects, handled := r.viewStep(m); handled {
 		return effects
@@ -242,6 +253,7 @@ func (r *Replica) Step(m Message) []Effect {
 			return nil
 		}
 		if m.Op > r.state.Op+1 {
+			r.elapsed = 0
 			return r.fetch(m.Op, m.Commit)
 		}
 		if m.Op <= r.state.Op {
@@ -260,6 +272,7 @@ func (r *Replica) Step(m Message) []Effect {
 			r.state.Op++
 			r.records[m.RequestID] = m.Op
 		}
+		r.elapsed = 0
 		r.advance(m.Commit, &effects)
 		send(Message{Kind: PrepareOK, To: primary, Op: m.Op})
 		r.finishTransfer(&effects)
@@ -273,7 +286,7 @@ func (r *Replica) Step(m Message) []Effect {
 		// gives us the two replicas needed for a quorum.
 		result := r.advance(m.Op, &effects)
 		// Tell backups about the commit immediately instead of waiting
-		// for the next prepare or a heartbeat.
+		// for the next prepare or a periodic COMMIT.
 		broadcast(Message{Kind: Commit, Commit: r.state.Commit})
 		send(Message{Kind: Reply, To: ClientEndpoint, RequestID: r.log[m.Op-1].requestID, Op: m.Op, Commit: r.state.Commit, Result: result})
 		effects = append(effects, Effect{Kind: CancelEffect})
@@ -281,6 +294,7 @@ func (r *Replica) Step(m Message) []Effect {
 		if r.id == primary || m.From != primary {
 			return nil
 		}
+		r.elapsed = 0
 		if m.Commit > r.state.Op {
 			return r.fetch(m.Commit, m.Commit)
 		}
