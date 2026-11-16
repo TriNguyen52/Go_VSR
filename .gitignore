@@ -5,3 +5,4 @@ artifacts/
 tools/
 internal/vsr/visualization_test.go
 docs/
+campaign-traces/
