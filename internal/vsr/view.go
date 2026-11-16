@@ -33,6 +33,7 @@ func validHistory(m Message) bool {
 }
 
 func (r *Replica) enterView(view uint64) {
+	r.elapsed = 0
 	r.state.View, r.changing = view, true
 	r.starts = [ReplicaCount]bool{}
 	r.starts[r.id] = true
@@ -76,6 +77,7 @@ func (r *Replica) install(m Message, out *[]Effect) {
 	}
 	r.state.View, r.state.Op = m.View, m.Op
 	r.changing = false
+	r.elapsed = 0
 	r.lastNormalView = m.View
 	r.transferID, r.wantOp, r.wantCommit = 0, 0, 0
 	r.acks = [ReplicaCount]bool{}
