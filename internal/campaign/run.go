@@ -26,10 +26,11 @@ type host struct {
 	retryIncarnation                   [4]uint64
 	retry, clocks                      [4]sim.TimerToken
 	callbacks                          [4]vsr.Message
-	isolated                           int
+	blocked                            [4][4]bool
 	healed                             bool
 	started, completed, events         int
-	lastCompletion                     sim.Time
+	lastCompletion, requestStarted     sim.Time
+	quorum                             *QuorumResult
 	usedNonces                         map[uint64]bool
 	err                                error
 }
@@ -40,11 +41,19 @@ func execute(config Config, build Build, expected *Trace) (*Trace, error) {
 	if config.Operations < 1 || config.Operations > 100000 || config.FaultUntil < 0 || config.MaxTime <= config.FaultUntil || config.MaxEvents < 1 {
 		return nil, fmt.Errorf("invalid campaign limits")
 	}
+	if config.Quorum != nil {
+		if err := config.Quorum.validate(config); err != nil {
+			return nil, err
+		}
+	}
 	trace := &Trace{Header: Header{Version: Version, Build: build, Config: config, Initial: initialState()}}
-	h := &host{config: config, isolated: -1, usedNonces: make(map[uint64]bool),
+	h := &host{config: config, usedNonces: make(map[uint64]bool),
 		workload: stream(config.Seeds.Workload), network: stream(config.Seeds.Network),
 		crashes: stream(config.Seeds.Crashes), nonces: stream(config.Seeds.Nonces),
 		j: journal{trace: trace, expected: expected}}
+	if config.Quorum != nil {
+		h.quorum = &QuorumResult{}
+	}
 	for id := 0; id < 4; id++ {
 		if id < 3 {
 			h.replicas[id] = vsr.New(id)
@@ -61,7 +70,11 @@ func execute(config Config, build Build, expected *Trace) (*Trace, error) {
 			return
 		}
 		if e.Time >= config.FaultUntil {
-			h.heal()
+			if h.quorum == nil {
+				h.heal()
+			} else {
+				h.freezeQuorum()
+			}
 			return
 		}
 		h.fault()
@@ -76,15 +89,29 @@ func execute(config Config, build Build, expected *Trace) (*Trace, error) {
 			}
 		}()
 		for h.err == nil && h.j.err == nil {
-			if !h.client.Pending() && h.started < config.Operations {
+			if h.quorum == nil && h.shouldStart() {
 				h.start()
 			}
-			if h.healed && h.converged() {
+			next, queued := h.runner.NextTime()
+			if (h.healed && h.converged()) || (h.quorum != nil && next > h.runner.Now() && h.checkQuorumProgress()) {
 				trace.Result.Complete = true
 				break
 			}
-			if h.events >= config.MaxEvents || h.runner.Now() >= config.MaxTime {
+			if h.err != nil {
+				break
+			}
+			timeExhausted := h.runner.Now() >= config.MaxTime
+			if h.quorum != nil {
+				timeExhausted = next > config.MaxTime
+			}
+			if !queued || h.events >= config.MaxEvents || timeExhausted {
 				h.err = fmt.Errorf("incomplete campaign: phase=%s started=%d completed=%d events=%d time=%d", h.phase(), h.started, h.completed, h.events, h.runner.Now())
+				break
+			}
+			if h.quorum != nil && h.shouldStart() {
+				h.start()
+			}
+			if h.err != nil || h.j.err != nil {
 				break
 			}
 			h.runner.Run(1)
@@ -93,6 +120,14 @@ func execute(config Config, build Build, expected *Trace) (*Trace, error) {
 	}()
 	trace.Result.Started, trace.Result.Completed, trace.Result.Events = h.started, h.completed, h.events
 	trace.Result.Time, trace.Result.TraceSHA256 = h.runner.Now(), h.runner.Digest()
+	trace.Result.Quorum = h.quorum
+	if h.quorum != nil && h.quorum.Eligible {
+		h.quorum.FreshCompleted = max(0, h.completed-h.quorum.StartedAtTransition)
+		if h.client.Pending() {
+			h.quorum.PendingRequest = h.started
+			h.quorum.LongestWait = max(h.quorum.LongestWait, h.quorumWait())
+		}
+	}
 	for id, r := range h.replicas {
 		trace.Result.States[id], trace.Result.Snapshots[id] = r.State(), r.Snapshot()
 	}
@@ -110,15 +145,38 @@ func execute(config Config, build Build, expected *Trace) (*Trace, error) {
 }
 
 func (h *host) phase() string {
+	if h.quorum != nil && h.quorum.Attempted {
+		return "quorum"
+	}
 	if h.healed {
 		return "healing"
 	}
 	return "faults"
 }
 
+func (h *host) shouldStart() bool {
+	if h.client.Pending() {
+		return false
+	}
+	if h.quorum == nil {
+		return h.started < h.config.Operations
+	}
+	if h.config.Quorum.Probe && h.runner.Now() < probeRequestTime {
+		return false
+	}
+	if !h.quorum.Eligible {
+		return h.runner.Now() < h.config.FaultUntil && h.started < h.config.Operations
+	}
+	return h.runner.Now() < h.quorum.ObservationEnd
+}
+
 func (h *host) start() {
 	var command kv.Command
 	h.j.decide("workload", h.runner.Now(), &command, func() {
+		if h.config.Quorum != nil && h.config.Quorum.Probe && h.started == 0 {
+			command = kv.Command{Op: kv.Add, Key: "x", Value: 1}
+			return
+		}
 		command = kv.Command{Op: kv.Operation(1 + h.workload.next()%3), Key: []string{"x", "y", "z"}[h.workload.next()%3], Value: int64(h.workload.next()%11) - 5}
 	})
 	if h.j.err != nil {
@@ -134,12 +192,16 @@ func (h *host) start() {
 		return
 	}
 	h.started++
+	h.requestStarted = h.runner.Now()
 	h.effects(vsr.ClientEndpoint, out)
 }
 
 func (h *host) deliver(id int, e sim.Event) {
 	h.j.observe("boundary", e.Time, e)
-	if h.j.err != nil || h.err != nil || (id < 3 && h.stopped[id]) {
+	if h.j.err != nil || h.err != nil {
+		return
+	}
+	if id < 3 && h.stopped[id] && (h.quorum == nil || e.Kind != sim.Message) {
 		return
 	}
 	if e.Kind == sim.Timeout && e.Timer.Name == "clock" {
@@ -158,14 +220,30 @@ func (h *host) deliver(id int, e sim.Event) {
 		} else if err := json.Unmarshal(e.Payload, &m); err != nil {
 			h.err = err
 			return
+		} else if h.quorum != nil && h.quorum.Eligible && h.blocked[m.From][m.To] {
+			// The permanent partition also drops pre-transition packets still in flight.
+			h.j.observe("blocked-delivery", e.Time, m)
+			return
+		}
+		if id < 3 && h.stopped[id] {
+			return
 		}
 		if id == vsr.ClientEndpoint {
 			pending := h.client.Pending()
 			h.effects(id, h.client.Step(m))
 			if pending && !h.client.Pending() {
 				h.err = h.checker.CheckReply(h.client.Response())
+				if h.err != nil {
+					return
+				}
 				h.completed++
 				h.lastCompletion = h.runner.Now()
+				if h.quorum != nil && h.quorum.Eligible {
+					h.quorum.LongestWait = max(h.quorum.LongestWait, h.quorumWait())
+					if h.completed == h.quorum.StartedAtTransition+1 {
+						h.quorum.FirstFreshReply = h.runner.Now()
+					}
+				}
 			}
 		} else {
 			h.effects(id, h.replicas[id].Step(m))
@@ -184,12 +262,14 @@ func (h *host) effects(owner int, effects []vsr.Effect) {
 		case vsr.SendEffect:
 			m := effect.Message
 			var delays []sim.Time
+			blocked := h.blocked[m.From][m.To]
+			reliable := h.healed || h.quorum != nil && h.quorum.Eligible
 			h.j.decide("network", h.runner.Now(), &delays, func() {
-				if !h.healed && (m.From == h.isolated || m.To == h.isolated || h.network.next()%5 == 0) {
+				if blocked || !reliable && h.network.next()%5 == 0 {
 					return
 				}
 				delays = []sim.Time{healedDelay}
-				if !h.healed {
+				if !reliable {
 					delays[0] += sim.Time(h.network.next() % 12)
 					if h.network.next()%5 == 0 {
 						delays = append(delays, 1+sim.Time(h.network.next()%12))
@@ -199,7 +279,8 @@ func (h *host) effects(owner int, effects []vsr.Effect) {
 			if h.j.err != nil {
 				return
 			}
-			if len(delays) > 2 || (h.healed && !reflect.DeepEqual(delays, []sim.Time{healedDelay})) {
+			if len(delays) > 2 || blocked && len(delays) != 0 ||
+				reliable && !blocked && (len(delays) != 1 || delays[0] != healedDelay) {
 				h.err = fmt.Errorf("invalid network decision")
 				return
 			}
@@ -281,18 +362,32 @@ func (h *host) fault() {
 			h.err = fmt.Errorf("failure budget exceeded")
 			return
 		}
-		h.stopped[id] = true
-		h.incarnation[id]++
-		h.runner.Cancel(endpoint(id), h.retry[id])
-		h.runner.Cancel(endpoint(id), h.clocks[id])
+		h.stop(id)
 	case "isolate":
-		h.isolated = id
+		h.blockReplica(id, true, true)
 	case "connect":
-		h.isolated = -1
+		h.blocked = [4][4]bool{}
 	default:
 		h.err = fmt.Errorf("invalid fault action %q", choice.Action)
 	}
 	h.check()
+}
+
+func (h *host) blockReplica(id int, incoming, outgoing bool) {
+	h.blocked = [4][4]bool{}
+	for peer := range h.blocked {
+		if peer != id {
+			h.blocked[peer][id] = incoming
+			h.blocked[id][peer] = outgoing
+		}
+	}
+}
+
+func (h *host) stop(id int) {
+	h.stopped[id] = true
+	h.incarnation[id]++
+	h.runner.Cancel(endpoint(id), h.retry[id])
+	h.runner.Cancel(endpoint(id), h.clocks[id])
 }
 
 func (h *host) restart(id int) {
@@ -323,7 +418,7 @@ func (h *host) restart(id int) {
 }
 
 func (h *host) heal() {
-	h.healed, h.isolated = true, -1
+	h.healed, h.blocked = true, [4][4]bool{}
 	h.j.observe("heal", h.runner.Now(), "bounded delay=1; restart stopped replicas")
 	for id := range h.replicas {
 		if h.stopped[id] {
