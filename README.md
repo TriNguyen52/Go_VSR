@@ -61,6 +61,29 @@ go test ./internal/vsr -run '^TestRecoveryDemo$' -count=1 -v
 
 See [recovery protocol details](docs/recovery.md) for nonce handling, timer fencing, and the failure budget.
 
+## Seeded fault campaigns and replay (M9)
+
+Build once, record a run, and replay it using the same executable:
+
+```powershell
+go build -o artifacts/vsr-campaign.exe ./cmd/vsr-campaign
+./artifacts/vsr-campaign.exe -seed 7 -out campaign-traces
+./artifacts/vsr-campaign.exe -replay campaign-traces/seed-7.json
+
+# A small campaign: 25 seeds, 20 logical operations per seed.
+./artifacts/vsr-campaign.exe -seed 1 -seeds 25 -operations 20 -out campaign-traces
+```
+
+Each run records its build, configuration, four independent seeds, fault decisions,
+and delivered boundaries. After virtual time 200, links heal, stopped replicas
+restart, and requests must finish within 5,000 total virtual time units and
+100,000 dequeued events. Incomplete runs fail and retain their journal. Replay
+checks the recorded decisions, effects, event order, final state, and trace digest;
+an incompatible executable or divergent trace fails explicitly.
+
+See [M9 details and failure diagnostics](M9.md) for limits, regression scenarios,
+and commands. This remains one client with one outstanding request.
+
 ## Files
 
 | Location | Purpose |
@@ -70,5 +93,7 @@ See [recovery protocol details](docs/recovery.md) for nonce handling, timer fenc
 | [`internal/client`](internal/client) | Request numbering, retries, and reply handling. |
 | [`internal/sim`](internal/sim) | Virtual-time event delivery, timers, and traces. |
 | [`internal/checker`](internal/checker) | Independent checks of history and application results. |
+| [`internal/campaign`](internal/campaign) | Seeded fault generation, healing, journals, and checked replay. |
+| [`cmd/vsr-campaign`](cmd/vsr-campaign) | Campaign and replay command. |
 
 

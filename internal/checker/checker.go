@@ -23,6 +23,27 @@ type Checker struct {
 	replicas  [vsr.ReplicaCount]progress
 }
 
+// CheckReply validates the client's result against independently evaluated
+// committed order, including delayed replies from an earlier view.
+func (c *Checker) CheckReply(m vsr.Message) error {
+	if m.Kind != vsr.Reply || m.Op == 0 || m.Commit < m.Op || c.requests[m.Op] != m.RequestID {
+		return fmt.Errorf("reply does not identify committed work: %+v", m)
+	}
+	values := make(map[string]int64)
+	var want kv.Result
+	for index := uint64(1); index <= m.Op; index++ {
+		command, ok := c.history[index]
+		if !ok {
+			return fmt.Errorf("reply has missing committed predecessor %d", index)
+		}
+		want = reference(values, command)
+	}
+	if m.Result != want {
+		return fmt.Errorf("reply result at %d: got %+v want %+v", m.Op, m.Result, want)
+	}
+	return nil
+}
+
 // Restart forgets only a crashed process's local progress, retaining global
 // committed history so reconstruction is still checked against prior results.
 func (c *Checker) Restart(id int) {
