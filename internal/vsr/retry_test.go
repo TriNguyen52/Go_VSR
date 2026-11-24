@@ -231,10 +231,19 @@ func TestLostReplyDemo(t *testing.T) {
 }
 
 func TestRetryWithoutQuorumIsIncomplete(t *testing.T) {
-	c := newRetryCluster(t, func(m vsr.Message) bool { return m.Kind == vsr.PrepareOK })
+	c := automaticCluster(t)
+	c.drop = func(m vsr.Message) bool {
+		return m.From == 1 || m.From == 2 || m.To == 1 || m.To == 2
+	}
 	c.start(t, commands[1])
-	if result := c.runner.Run(100); result.Complete || !c.client.Pending() || c.replicas[0].State().Applied != 0 {
-		t.Fatal(result, c.client.Response(), c.replicas[0].State())
+	until(t, c, func() bool { return c.runner.Now() >= 250 })
+	if !c.client.Pending() {
+		t.Fatal("client finished without a quorum")
+	}
+	for id, replica := range c.replicas {
+		if state := replica.State(); state.Commit != 0 || state.Applied != 0 {
+			t.Fatalf("replica %d committed without a quorum: %+v", id, state)
+		}
 	}
 }
 

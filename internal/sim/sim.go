@@ -68,6 +68,14 @@ type Runner struct {
 // Now returns the current simulated time, starting at zero.
 func (r *Runner) Now() Time { return r.now }
 
+// NextTime reports the time of the next queued event, including stale timers.
+func (r *Runner) NextTime() (Time, bool) {
+	if len(r.queue) == 0 {
+		return 0, false
+	}
+	return r.queue[0].Time, true
+}
+
 // Register assigns a handler to a participant.
 // It panics if the name is empty, the handler is nil, or the name is already used.
 func (r *Runner) Register(id Endpoint, handler func(Event)) {

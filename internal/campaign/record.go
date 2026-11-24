@@ -12,7 +12,7 @@ import (
 	"go-vsr/internal/vsr"
 )
 
-const Version = "vsr-campaign-1"
+const Version = "vsr-campaign-2"
 
 const (
 	clockInterval sim.Time = 1
@@ -54,6 +54,7 @@ type Config struct {
 	Operations          int
 	FaultUntil, MaxTime sim.Time
 	MaxEvents           int
+	Quorum              *QuorumConfig `json:",omitempty"`
 }
 
 func Default(seed uint64) Config {
@@ -96,6 +97,7 @@ type Result struct {
 	States                     [3]vsr.Counters
 	Snapshots                  [3][]kv.Entry
 	TraceSHA256                string
+	Quorum                     *QuorumResult `json:",omitempty"`
 }
 
 type Trace struct {

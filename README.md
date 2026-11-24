@@ -84,6 +84,44 @@ an incompatible executable or divergent trace fails explicitly.
 See [M9 details and failure diagnostics](M9.md) for limits, regression scenarios,
 and commands. This remains one client with one outstanding request.
 
+## Quorum liveness campaigns
+
+Quorum mode runs the seeded fault phase, then gives the chosen pair and the
+client reliable one-tick delivery. The third replica stays stopped, isolated,
+send-only, or receive-only. Messages already in flight keep their scheduled
+arrival time and are dropped if their direction is blocked at delivery.
+
+```powershell
+go build -o artifacts/vsr-campaign.exe ./cmd/vsr-campaign
+
+# Run all 12 cases from a fresh cluster, including the known one-way stalls.
+./artifacts/vsr-campaign.exe -seed 1 -quorum matrix -fault-until 0
+
+# Run a seeded fault phase before keeping replica 2 stopped.
+./artifacts/vsr-campaign.exe -seed 1 -quorum '0,1' -permanent-fault stopped
+
+# Compare the fault-free control with the reproduced one-way stall.
+./artifacts/vsr-campaign.exe -probe baseline
+./artifacts/vsr-campaign.exe -probe stall
+./artifacts/vsr-campaign.exe -replay campaign-traces/seed-1-probe-stall.json
+```
+
+The workload carries its outstanding request across the transition and submits
+fresh requests for 500 ticks by default. A request may wait up to 200 ticks
+after submission or the transition, whichever came later. Both healthy replicas
+must apply all completed work by 200 ticks after the observation window. Use
+`-observe`, `-request-limit`, and `-catch-up-limit` to set these budgets.
+The fixed probe starts its first request at tick 100 and uses a 70-tick request
+limit. The current protocol misses that deadline with replica 2 send-only.
+
+Both selected replicas must be running and recovered when the seeded phase
+ends. A link-fault case also needs its third replica running. The matrix reports
+ineligible cases separately, saves their journals, and exits unsuccessfully if
+any case fails or is ineligible. Use `-fault-until 0` to exercise every case from
+a fresh cluster. Matrix journals include the seed, pair, and fault in the
+filename. Replay uses the original executable and returns the original failure
+status when it reproduces a failed run.
+
 ## Files
 
 | Location | Purpose |
